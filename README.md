@@ -7,12 +7,66 @@ des cas limites et 25 tests aléatoires).
 
 ## Installation
 
-Il faut `python3` et `cc`.
+### Prérequis
+
+- `git`
+- `python3` (3.7 ou plus récent), sans aucune bibliothèque à installer
+- `cc` (gcc ou clang) et `nm` (binutils, pour vérifier les fonctions autorisées)
+
+Sur les postes de 42, tout est déjà installé.
+
+### 1. Cloner le dépôt
 
 ```sh
 git clone https://github.com/UgoRastell/42-exam-rank02.git ~/42/exam
-mkdir -p ~/.local/bin && ln -sf ~/42/exam/exam ~/.local/bin/exam   # ~/.local/bin doit être dans le PATH
-exam start
+```
+
+Tu peux le cloner ailleurs : les dossiers `rendu/` et `subjects/` sont toujours
+créés à côté du script `exam`.
+
+### 2. Rendre la commande `exam` disponible partout
+
+```sh
+mkdir -p ~/.local/bin
+ln -sf ~/42/exam/exam ~/.local/bin/exam
+```
+
+Si `~/.local/bin` n'est pas dans ton `PATH` (`exam` renvoie *command not found*),
+ajoute-le puis ouvre un nouveau terminal :
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc    # ou ~/.bashrc
+```
+
+Sans lien, tu peux aussi lancer `~/42/exam/exam start` directement.
+
+### 3. Vérifier
+
+```sh
+exam list     # doit afficher les 57 exercices
+exam start    # démarre un examen au niveau 1
+```
+
+### Ne pas voir les solutions (VS Code)
+
+Les sujets, les solutions et les tests sont dans le dossier caché `.exercises/`.
+Pour ne pas tomber dessus dans VS Code, crée `.vscode/settings.json` dans le dossier :
+
+```json
+{
+  "files.exclude": {
+    ".exercises": true,
+    ".state.json": true,
+    "exam": true
+  }
+}
+```
+
+### Mettre à jour / désinstaller
+
+```sh
+cd ~/42/exam && git pull                     # mise à jour (ta progression est conservée)
+rm -rf ~/42/exam ~/.local/bin/exam ~/.cache/42exam   # désinstallation
 ```
 
 ## Utilisation
