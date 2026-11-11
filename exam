@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""exam — simulateur d'examen 42 (01_Exam_C-language), niveaux 1 à 4.
+
+  exam start [niveau]   nouvelle session (niveau 1 par défaut), sujet tiré au hasard
+  exam grademe          corrige l'exercice en cours (comme la moulinette)
+  exam status           niveau, exercice, temps écoulé, tentatives
+  exam subject          réaffiche le sujet
+  exam skip             change d'exercice dans le même niveau (entraînement)
+  exam pick <nom>       choisit un exercice précis
+  exam list             tous les exercices, ✓ ceux déjà réussis
+  exam trace            détail du dernier échec
+  exam solution         montre la solution de référence (après avoir essayé !)
+
+Ton code va dans ~/42/exam/rendu/<exercice>/, le sujet dans ~/42/exam/subjects/<exercice>/.
+"""
+import glob, json, os, random, re, shlex, shutil, string, subprocess, sys, time
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+EXDIR = os.path.join(ROOT, ".exercises")
+RENDU = os.path.join(ROOT, "rendu")
+SUBJECTS = os.path.join(ROOT, "subjects")
+TRACES = os.path.join(ROOT, "traces")
+STATE = os.path.join(ROOT, ".state.json")
+BUILD = os.path.expanduser("~/.cache/42exam")
+MAX_LEVEL = 4
+# -std=gnu17 : comme les postes de 42 (GCC >= 15 passe en C23, où « int (*f)() » veut dire « sans argument »)
+STD = "-std=gnu17"
+CFLAGS = [STD, "-Wall", "-Wextra", "-Werror"]
+RANDOM_TESTS = 25
+# Le compilateur insère parfois ces appels (ex. int tab[256] = {0} → memset) : pas ta faute
+COMPILER_ADDED = {"memset", "memcpy", "memmove"}
+
+TTY = sys.stdout.isatty()
+def c(code, s): return f"\033[{code}m{s}\033[0m" if TTY else s
+G = lambda s: c("32", s); RED = lambda s: c("31", s); Y = lambda s: c("33", s)
+B = lambda s: c("1", s); D = lambda s: c("2", s); M = lambda s: c("35", s)
+
+
+# ───────────────────────────── exercices ─────────────────────────────
+def exercises():
+    out = {}
+    for lvl in range(1, MAX_LEVEL + 1):
+        d = os.path.join(EXDIR, f"level{lvl}")
+        for name in sorted(os.listdir(d)):
+            path = os.path.join(d, name)
+            subject = open(os.path.join(path, "subject.en.txt")).read()
+            files = re.search(r"Expected files\s*:\s*(.*)", subject).group(1)
+            allowed = re.search(r"Allowed functions\s*:\s*(.*)", subject)
+            allowed = allowed.group(1) if allowed else ""
+            out[name] = {
+                "name": name, "level": lvl, "path": path, "subject": subject,
+                "files": [f.strip() for f in files.split(",") if f.strip()],
+                "allowed": {a.strip() for a in re.split(r"[,\s]+", allowed)
+                            if a.strip() and a.strip().lower() != "none"},
+                "function": os.path.exists(os.path.join(path, "main.c")),
+            }
+    return out
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(st):
+    json.dump(st, open(STATE, "w"), indent=2)
+
+
+def elapsed(st):
+    s = int(time.time() - st["started"])
+    return f"{s // 3600}h{s % 3600 // 60:02d}"
+
+
+def install(ex):
+    """Pose le sujet dans subjects/ et prépare rendu/<nom>/ (sans écraser ton travail)."""
+    sd = os.path.join(SUBJECTS, ex["name"])
+    os.makedirs(sd, exist_ok=True)
+    shutil.copy(os.path.join(ex["path"], "subject.en.txt"), sd)
+    os.makedirs(os.path.join(RENDU, ex["name"]), exist_ok=True)
+
+
+def show_subject(ex):
+    print(D("─" * 80))
+    print(ex["subject"].rstrip())
+    print(D("─" * 80))
+    print(f"Écris ton code dans {B(os.path.join(RENDU, ex['name']))}/  "
+          f"({', '.join(ex['files'])}), puis : {B('exam grademe')}")
+
+
+def pick(st, exos, level, avoid=None):
+    pool = [e for e in exos.values() if e["level"] == level and e["name"] != avoid]
+    ex = random.choice(pool)
+    st.update(level=level, current=ex["name"], attempts=0)
+    save_state(st)
+    install(ex)
+    return ex
+
+
+# ───────────────────────────── tests ─────────────────────────────
+def rnd_str(r, alphabet, lo=0, hi=30):
+    return "".join(r.choice(alphabet) for _ in range(r.randint(lo, hi)))
+
+PRINT = string.ascii_letters + string.digits + " .,;:!?'-_*/"
+WORDY = string.ascii_letters + "   \t\t.,"
+SMALL = "abcdefgh ."
+
+def camel(r):
+    words = [rnd_str(r, string.ascii_lowercase, 1, 6) for _ in range(r.randint(1, 5))]
+    return words[0] + "".join(w.capitalize() for w in words[1:])
+
+def snake(r):
+    return "_".join(rnd_str(r, string.ascii_lowercase, 1, 6) for _ in range(r.randint(1, 5)))
+
+# Générateurs d'arguments aléatoires, par programme
+GEN = {
+    "first_word": lambda r: [rnd_str(r, WORDY)],
+    "last_word": lambda r: [rnd_str(r, WORDY)],
+    "repeat_alpha": lambda r: [rnd_str(r, PRINT, 0, 15)],
+    "rev_print": lambda r: [rnd_str(r, PRINT)],
+    "rot_13": lambda r: [rnd_str(r, PRINT)],
+    "rotone": lambda r: [rnd_str(r, PRINT)],
+    "ulstr": lambda r: [rnd_str(r, PRINT)],
+    "alpha_mirror": lambda r: [rnd_str(r, PRINT)],
+    "search_and_replace": lambda r: [rnd_str(r, SMALL), r.choice(SMALL[:-2]), r.choice(string.ascii_letters)],
+    "camel_to_snake": lambda r: [camel(r)],
+    "snake_to_camel": lambda r: [snake(r)],
+    "inter": lambda r: [rnd_str(r, SMALL), rnd_str(r, SMALL)],
+    "union": lambda r: [rnd_str(r, SMALL), rnd_str(r, SMALL)],
+    "wdmatch": lambda r: [rnd_str(r, "abc", 0, 5), rnd_str(r, "abcd ", 0, 20)],
+    "hidenp": lambda r: [rnd_str(r, "abc", 0, 5), rnd_str(r, "abcd ", 0, 20)],
+    "add_prime_sum": lambda r: [str(r.randint(-20, 3000))],
+    "paramsum": lambda r: [str(r.randint(0, 99)) for _ in range(r.randint(0, 12))],
+    "fizzbuzz": lambda r: [],
+    "do_op": lambda r: do_op_args(r),
+    "epur_str": lambda r: [rnd_str(r, WORDY)],
+    "expand_str": lambda r: [rnd_str(r, WORDY)],
+    "pgcd": lambda r: [str(r.randint(1, 100000)), str(r.randint(1, 100000))],
+    "print_hex": lambda r: [str(r.choice([r.randint(0, 300), r.randint(0, 2147483647)]))],
+    "str_capitalizer": lambda r: [rnd_str(r, WORDY + "aAzZ09_!") for _ in range(r.randint(1, 3))],
+    "rstr_capitalizer": lambda r: [rnd_str(r, WORDY + "aAzZ09_!") for _ in range(r.randint(1, 3))],
+    "tab_mult": lambda r: [str(r.choice([r.randint(1, 100), r.randint(1, 238609294)]))],
+    "fprime": lambda r: [str(r.choice([r.randint(1, 1000), r.randint(1, 10000000)]))],
+    "rev_wstr": lambda r: [" ".join(rnd_str(r, PRINT.replace(" ", ""), 1, 8) for _ in range(r.randint(1, 7)))],
+    "rostring": lambda r: [rnd_str(r, WORDY)] + ([rnd_str(r, SMALL)] if r.random() < 0.2 else []),
+}
+
+
+def do_op_args(r):
+    op = r.choice("+-*/%")
+    if op in "+-":
+        a, b = r.randint(-1000000000, 1000000000), r.randint(-1000000000, 1000000000)
+    elif op == "*":
+        a, b = r.randint(-40000, 40000), r.randint(-40000, 40000)
+    else:
+        a, b = r.randint(-100000, 100000), r.choice([i for i in range(-500, 501) if i])
+    return [str(a), op, str(b)]
+
+# Cas limites ajoutés aux exemples du sujet
+EXTRA = {
+    "first_word": [[""], ["\t\tabc\tdef"], ["mot"], ["   fin"]],
+    "last_word": [[""], ["abc\t\t"], ["mot"], ["debut   "], ["a\tb"]],
+    "repeat_alpha": [["zZ"], ["123"]],
+    "rev_print": [[""], ["a"], ["ab"], ["a", "b"]],
+    "rot_13": [["zZ mM nN aA"], ["a", "b"]],
+    "rotone": [["zZ yY aA"], ["a", "b"]],
+    "ulstr": [[""], ["123 !?"], ["a", "b"]],
+    "alpha_mirror": [[""], ["aAzZmMnN 42"], ["a", "b"]],
+    "search_and_replace": [["abc", "a", "b"], ["", "a", "b"], ["abc", "", "b"], ["abc", "a"]],
+    "camel_to_snake": [["a"], ["helloWorldAgain"], ["a", "b"]],
+    "snake_to_camel": [["a"], ["hello_world_again"], ["a", "b"]],
+    "inter": [["", "abc"], ["abc", ""], ["aaa", "a"], ["a", "b", "c"]],
+    "union": [["", ""], ["abc", ""], ["", "abc"], ["aaa", "aaa"], ["a", "b", "c"]],
+    "wdmatch": [["", "abc"], ["abc", ""], ["abc", "abc"], ["a"]],
+    "hidenp": [["", "abc"], ["", ""], ["abc", ""], ["abc", "abc"], ["a"]],
+    "add_prime_sum": [["0"], ["1"], ["2"], ["3"], ["-5"], ["100"], ["1", "2"]],
+    "paramsum": [[], ["a"], [""]],
+    "fizzbuzz": [[]],
+    "do_op": [["0", "+", "0"], ["-7", "%", "3"], ["7", "/", "-2"], ["2147483647", "-", "0"], ["1", "+"]],
+    "epur_str": [["\t\t a \t b\t"], ["mot"], ["   "], ["a", "b"]],
+    "expand_str": [["\t\t a \t b\t"], ["mot"], ["   "], ["a", "b"]],
+    "pgcd": [["1", "1"], ["7", "7"], ["2147483647", "1"], ["100", "75"], ["42"]],
+    "print_hex": [["0"], ["15"], ["16"], ["2147483647"], ["1", "2"]],
+    "str_capitalizer": [[""], ["a"], ["\tbonjour\tLE monde"], ["42abc ABC"], ["x", "", "y"]],
+    "rstr_capitalizer": [[""], ["a"], ["\tbonjour\tLE monde"], ["abc42 ABC"], ["x", "", "y"]],
+    "tab_mult": [["1"], ["238609294"], ["1", "2"]],
+    "fprime": [["2"], ["3"], ["4"], ["1024"], ["9999991"], ["2147483646"], ["1", "2"]],
+    "rev_wstr": [["a"], ["a b"], [""], ["a", "b"]],
+    "rostring": [[""], ["   "], ["a"], ["\tun\tdeux  trois\t"], ["un deux", "x"]],
+}
+
+
+def subject_args(ex):
+    """Arguments des exemples du sujet : lignes « $>./prog ... »."""
+    out = []
+    for line in ex["subject"].splitlines():
+        m = re.match(r"\s*\$>\s*\./\S+(.*)$", line)
+        if not m:
+            continue
+        cmd = re.sub(r"\|\s*cat\s+-e\s*$", "", m.group(1)).strip()
+        try:
+            out.append(shlex.split(cmd))
+        except ValueError:
+            pass
+    return out
+
+
+def cat_e(b):
+    """Comme cat -e : $ en fin de ligne, ^X pour les caractères de contrôle, M- au-delà de 127."""
+    if not b:
+        return "(rien)\n"
+    out = []
+    for x in b:
+        pre = ""
+        if x >= 128:
+            pre, x = "M-", x - 128
+        if x == 10 and not pre:
+            out.append("$\n")
+        elif x < 32 or x == 127:
+            out.append(pre + "^" + chr(x ^ 64))
+        else:
+            out.append(pre + chr(x))
+    return "".join(out)
+
+
+def run(binary, args):
+    try:
+        p = subprocess.run([binary] + args, capture_output=True, timeout=3)
+    except subprocess.TimeoutExpired:
+        return None, "timeout (boucle infinie ?)"
+    if p.returncode < 0:
+        import signal
+        return p.stdout, f"crash : {signal.Signals(-p.returncode).name}"
+    return p.stdout, None
+
+
+def compile_to(srcs, out, includes, objdir, werror=True, link=True):
+    """Compile chaque source en .o puis lie (si link). Renvoie (ok, messages, objets)."""
+    os.makedirs(objdir, exist_ok=True)
+    objs = []
+    for s in srcs:
+        o = os.path.join(objdir, os.path.basename(s) + ".o")
+        flags = CFLAGS if werror else [STD, "-w"]
+        p = subprocess.run(["cc"] + flags + includes + ["-c", s, "-o", o], capture_output=True, text=True)
+        if p.returncode:
+            return False, p.stderr, objs
+        objs.append(o)
+    if not link:
+        return True, "", objs
+    p = subprocess.run(["cc"] + objs + ["-o", out], capture_output=True, text=True)
+    if p.returncode:
+        return False, p.stderr, objs
+    return True, "", objs
+
+
+def external_calls(objs):
+    names = set()
+    for o in objs:
+        p = subprocess.run(["nm", "-u", o], capture_output=True, text=True)
+        for line in p.stdout.split():
+            if line != "U" and not line.startswith("_"):
+                names.add(line.split("@")[0])
+    return names
+
+
+def grade(ex):
+    name, rd = ex["name"], os.path.join(RENDU, ex["name"])
+    build = os.path.join(BUILD, name)
+    shutil.rmtree(build, ignore_errors=True)
+    os.makedirs(build)
+    trace = []
+
+    def fail(title, details=""):
+        trace.append(title + ("\n\n" + details if details else ""))
+        os.makedirs(TRACES, exist_ok=True)
+        with open(os.path.join(TRACES, f"{name}.txt"), "w") as f:
+            f.write("\n".join(trace) + "\n")
+        print(RED(f"✗ FAILURE : {title}"))
+        if details:
+            print(details.rstrip())
+        return False
+
+    # 1. fichiers attendus
+    # « *.c, *.h » : au moins un .c ; sinon chaque fichier nommé doit exister
+    missing, user_c = [], []
+    for f in ex["files"]:
+        if "*" in f:
+            found = sorted(glob.glob(os.path.join(rd, f)))
+            if f.endswith(".c") and not found:
+                missing.append(f)
+            user_c += [x for x in found if x.endswith(".c")]
+        elif not os.path.isfile(os.path.join(rd, f)):
+            missing.append(f)
+        elif f.endswith(".c"):
+            user_c.append(os.path.join(rd, f))
+    if missing:
+        return fail("fichier(s) manquant(s) : " + ", ".join(missing), f"Attendu dans {rd}/")
+
+    # 2. compilation (ton code avec -Wall -Wextra -Werror ; le main de test à part)
+    main = os.path.join(ex["path"], "main.c")
+    inc_user = ["-I" + rd, "-I" + os.path.join(ex["path"], "include")]
+    ok, err, objs = compile_to(user_c, os.path.join(build, "user"), inc_user, os.path.join(build, "o_user"),
+                               link=not ex["function"])
+    if not ok:
+        return fail("ton code ne compile pas (cc -Wall -Wextra -Werror)", err)
+    if ex["function"]:
+        if any(re.search(r"\bT main$", subprocess.run(["nm", o], capture_output=True, text=True).stdout, re.M)
+               for o in objs):
+            return fail("ton fichier contient un main : pour une fonction, rends seulement la fonction")
+        p = subprocess.run(["cc", STD, "-w"] + inc_user + [main] + objs + ["-o", os.path.join(build, "user")],
+                           capture_output=True, text=True)
+        if p.returncode:
+            return fail("l'édition de liens avec le main de test échoue (prototype ou nom différent ?)", p.stderr)
+
+    # 3. fonctions autorisées
+    used = external_calls(objs)
+    # printf autorisé : le compilateur peut le remplacer par puts/putchar
+    implied = {"puts", "putchar"} if "printf" in ex["allowed"] else set()
+    bad = sorted(used - ex["allowed"] - COMPILER_ADDED - implied)
+    if bad:
+        allowed = ", ".join(sorted(ex["allowed"])) or "aucune"
+        hint = ""
+        if set(bad) & {"puts", "putchar"}:
+            hint = "\n(le compilateur transforme printf en puts/putchar : cherche un printf)"
+        return fail("fonction(s) interdite(s) : " + ", ".join(bad), f"Autorisées : {allowed}{hint}")
+
+    # 4. référence
+    ref_srcs = [os.path.join(ex["path"], "ref.c")] + ([main] if ex["function"] else [])
+    ok, err, _ = compile_to(ref_srcs, os.path.join(build, "ref"), ["-I" + os.path.join(ex["path"], "include")],
+                            os.path.join(build, "o_ref"), werror=False)
+    if not ok:
+        return fail("erreur interne : la référence ne compile pas", err)
+
+    # 5. tests
+    if ex["function"]:
+        tests = [[]]
+    else:
+        r = random.Random()
+        tests = subject_args(ex) + EXTRA.get(name, [])
+        tests += [GEN[name](r) for _ in range(RANDOM_TESTS)] if name in GEN else []
+    for i, args in enumerate(tests, 1):
+        exp, eerr = run(os.path.join(build, "ref"), args)
+        got, gerr = run(os.path.join(build, "user"), args)
+        if gerr or got != exp:
+            cmd = f"./{name} " + shlex.join(args) if not ex["function"] else "programme de test (main de la moulinette)"
+            detail = f"Test {i}/{len(tests)} : {cmd}\n"
+            if gerr:
+                detail += f"\n{gerr}\n"
+            if ex["function"] and not gerr:
+                el, gl = cat_e(exp).splitlines(), cat_e(got).splitlines()
+                for k in range(max(len(el), len(gl))):
+                    a = el[k] if k < len(el) else "(fin)"
+                    b = gl[k] if k < len(gl) else "(fin)"
+                    if a != b:
+                        detail += f"\nPremière différence, ligne {k + 1} :\n  attendu : {a}\n  obtenu  : {b}\n"
+                        break
+            elif not gerr:
+                detail += f"\nAttendu (cat -e) :\n{cat_e(exp)}\nObtenu (cat -e) :\n{cat_e(got)}"
+            return fail("mauvaise sortie" if not gerr else gerr, detail)
+    print(G(f"✓ SUCCESS") + D(f" — {len(tests)} test(s) passé(s)"))
+    return True
+
+
+# ───────────────────────────── commandes ─────────────────────────────
+def need_session():
+    st = load_state()
+    if not st or not st.get("current"):
+        sys.exit("Pas de session en cours : lance « exam start ».")
+    return st
+
+
+def wipe():
+    """Nouvel examen : efface rendu/, subjects/, traces/ et les binaires de correction,
+    comme une session d'examen qui démarre sur un dossier vide."""
+    old = [os.path.relpath(os.path.join(dp, f), RENDU)
+           for dp, _, fs in os.walk(RENDU) for f in fs] if os.path.isdir(RENDU) else []
+    for d in (RENDU, SUBJECTS, TRACES, BUILD):
+        shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(RENDU)
+    os.makedirs(SUBJECTS)
+    if old:
+        print(D(f"Ancien travail effacé ({len(old)} fichier(s) dans rendu/)."))
+
+
+def cmd_start(argv, exos):
+    level = int(argv[0]) if argv else 1
+    if not 1 <= level <= MAX_LEVEL:
+        sys.exit(f"Niveau entre 1 et {MAX_LEVEL}.")
+    wipe()
+    st = {"started": time.time(), "passed": (load_state() or {}).get("passed", []), "history": []}
+    ex = pick(st, exos, level)
+    print(M(f"── Examen lancé — niveau {level}/{MAX_LEVEL} : {B(ex['name'])}"))
+    show_subject(ex)
+
+
+def cmd_status(_, exos):
+    st = need_session()
+    if st.get("finished"):
+        print(G(f"Examen terminé : 100/100 en {elapsed(st)}.") + " Relance avec « exam start ».")
+        return
+    ex = exos[st["current"]]
+    score = (st["level"] - 1) * 100 // MAX_LEVEL
+    print(f"Niveau {B(st['level'])}/{MAX_LEVEL} · exercice {B(ex['name'])} · "
+          f"score {score}/100 · tentatives {st['attempts']} · temps {elapsed(st)}")
+    for h in st["history"]:
+        print(D(f"  ✓ niveau {h['level']} : {h['name']} ({h['attempts']} tentative(s))"))
+
+
+def cmd_subject(_, exos):
+    show_subject(exos[need_session()["current"]])
+
+
+def cmd_grademe(_, exos):
+    st = need_session()
+    if st.get("finished"):
+        return cmd_status(_, exos)
+    ex = exos[st["current"]]
+    print(M(f"── Correction de {ex['name']} (niveau {st['level']}, tentative {st['attempts'] + 1})"))
+    st["attempts"] += 1
+    if not grade(ex):
+        save_state(st)
+        print(D(f"Corrige et relance « exam grademe » (détail : exam trace)."))
+        return
+    st["history"].append({"level": st["level"], "name": ex["name"], "attempts": st["attempts"]})
+    if ex["name"] not in st["passed"]:
+        st["passed"].append(ex["name"])
+    if st["level"] >= MAX_LEVEL:
+        st["finished"] = True
+        save_state(st)
+        print(G(B(f"\n🎉 Examen réussi : 100/100 en {elapsed(st)} !")))
+        return
+    nxt = pick(st, exos, st["level"] + 1)
+    print(G(f"\nScore : {(st['level'] - 1) * 100 // MAX_LEVEL}/100 → niveau {st['level']} : {B(nxt['name'])}"))
+    show_subject(nxt)
+
+
+def cmd_skip(_, exos):
+    st = need_session()
+    ex = pick(st, exos, st["level"], avoid=st["current"])
+    print(Y(f"Nouvel exercice niveau {st['level']} : {B(ex['name'])}"))
+    show_subject(ex)
+
+
+def cmd_pick(argv, exos):
+    if not argv or argv[0] not in exos:
+        sys.exit("usage : exam pick <nom>   (voir exam list)")
+    ex = exos[argv[0]]
+    st = load_state() or {"started": time.time(), "passed": [], "history": []}
+    st.pop("finished", None)
+    st.update(level=ex["level"], current=ex["name"], attempts=0)
+    save_state(st)
+    install(ex)
+    show_subject(ex)
+
+
+def cmd_list(_, exos):
+    passed = set((load_state() or {}).get("passed", []))
+    for lvl in range(1, MAX_LEVEL + 1):
+        names = [e["name"] for e in exos.values() if e["level"] == lvl]
+        done = sum(n in passed for n in names)
+        print(M(f"Niveau {lvl}") + D(f" ({done}/{len(names)})"))
+        for n in names:
+            kind = "fonction" if exos[n]["function"] else "programme"
+            print(f"  {G('✓') if n in passed else ' '} {n:<20}{D(kind)}")
+
+
+def cmd_trace(_, exos):
+    st = need_session()
+    path = os.path.join(TRACES, f"{st['current']}.txt")
+    print(open(path).read() if os.path.exists(path) else "Pas de trace pour cet exercice.")
+
+
+def cmd_solution(_, exos):
+    st = need_session()
+    ex = exos[st["current"]]
+    if st["attempts"] == 0:
+        print(Y("Tu n'as pas encore essayé « exam grademe ». Le jour de l'examen, pas de solution !"))
+    if input("Afficher la solution de référence ? (o/N) ").strip().lower() not in ("o", "oui", "y"):
+        return
+    print(D("─" * 80))
+    print(open(os.path.join(ex["path"], "ref.c")).read())
+    print(D("(référence de correction : écrite pour être courte, pas à la norme)"))
+
+
+COMMANDS = {"start": cmd_start, "grademe": cmd_grademe, "status": cmd_status, "subject": cmd_subject,
+            "skip": cmd_skip, "pick": cmd_pick, "list": cmd_list, "trace": cmd_trace,
+            "solution": cmd_solution}
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help") or args[0] not in COMMANDS:
+        print(__doc__)
+        sys.exit(0 if not args or args[0] in ("-h", "--help", "help") else 1)
+    COMMANDS[args[0]](args[1:], exercises())
